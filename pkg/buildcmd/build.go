@@ -62,6 +62,40 @@ func New(rootConfig *rootcmd.Config) *ffcli.Command {
 	}
 }
 
+var repositoryDeletedErrorStrings = []string{
+	"Repository not found",
+	"Confirm the import path was entered correctly",
+}
+
+type moduleErrType int
+
+const (
+	moduleErrTypeUnknown moduleErrType = iota
+	moduleErrTypeWrongVersion
+	moduleErrTypeWrongPath
+	moduleErrTypeDeleted
+)
+
+func (c *Config) extractModuleNameFromError(s string) (string, moduleErrType) {
+	if strings.Contains(s, "unknown revision") {
+		return "", moduleErrTypeWrongVersion
+	}
+	wasReuiredAs := regexp.MustCompile(`but was required as: (.*)`)
+	if matches := wasReuiredAs.FindStringSubmatch(s); len(matches) == 2 {
+		return matches[1], moduleErrTypeWrongPath
+	}
+	var typ moduleErrType = moduleErrTypeWrongVersion
+	if stringsContains(repositoryDeletedErrorStrings, s) {
+		typ = moduleErrTypeDeleted
+	}
+	failedModuleRe := regexp.MustCompile(`module (.*?):`)
+	matches := failedModuleRe.FindStringSubmatch(s)
+	if len(matches) == 2 {
+		return matches[1], typ
+	}
+	return "", moduleErrTypeUnknown
+}
+
 // Exec function for this command.
 func (c *Config) Exec(ctx context.Context, args []string) error {
 	const configAll = "config.json"
@@ -92,6 +126,44 @@ func (c *Config) Exec(ctx context.Context, args []string) error {
 	var err error
 	bc.mmap, err = bc.GetHugoModulesMap(configAll)
 	if err != nil {
+		failedModulePath, errTyp := c.extractModuleNameFromError(err.Error())
+		if errTyp == moduleErrTypeUnknown {
+			return err
+		}
+
+		switch errTyp {
+		case moduleErrTypeWrongVersion:
+			c.rootConfig.Client.Logf("The theme %q seem to have a version problem, now removing go.mod, go.sum and start over...", failedModulePath)
+		case moduleErrTypeWrongPath:
+			c.rootConfig.Client.Logf("The theme %q seem to have a path problem, now removing go.mod, go.sum and the theme from themes.txt and start over", failedModulePath)
+		case moduleErrTypeDeleted:
+			c.rootConfig.Client.Logf("The theme %q seem to have been deleted or, now removing go.mod, go.sum and the theme from themes.txt and start over...", failedModulePath)
+		}
+
+		if err := bc.RemoveGoModAndGoSum(); err != nil {
+			return fmt.Errorf("failed to remove go.mod and go.sum: %w", err)
+		}
+
+		if err := bc.InitModule(); err != nil {
+			return fmt.Errorf("failed to init module: %w", err)
+		}
+
+		switch errTyp {
+		case moduleErrTypeWrongPath, moduleErrTypeDeleted:
+			if err := bc.RemoveModulePathFromThemesTxt(failedModulePath); err != nil {
+				return fmt.Errorf("failed to remove module %q from themes.txt: %w", failedModulePath, err)
+			}
+			if err := bc.CreateThemesConfig(); err != nil {
+				return err
+			}
+		}
+
+		// Try again
+		bc.mmap, err = bc.GetHugoModulesMap(configAll)
+		if err != nil {
+			return err
+		}
+
 		return err
 	}
 
@@ -111,6 +183,15 @@ func (c *Config) Exec(ctx context.Context, args []string) error {
 	}
 
 	return nil
+}
+
+func stringsContains(ss []string, s string) bool {
+	for _, v := range ss {
+		if strings.Contains(s, v) {
+			return true
+		}
+	}
+	return false
 }
 
 type buildClient struct {
@@ -482,7 +563,7 @@ func (t *theme) checkLastMod() (warn warning, found bool) {
 	if !lastMod.IsZero() {
 		age := time.Since(lastMod)
 		ageYears := age.Hours() / 24 / 365
-		if ageYears > 3 {
+		if ageYears > 1 {
 			warn = themeWarningOld
 			found = true
 		}
@@ -510,7 +591,7 @@ var (
 	// Not updated for the last 2 years.
 	themeWarningOld = warning{
 		level:   errorLevelWarn,
-		message: "This theme has not been updated for more than 2 years.",
+		message: "This theme hasn't been updated in over a year.",
 	}
 
 	themeWarningBadURL = warning{
